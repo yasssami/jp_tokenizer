@@ -164,6 +164,10 @@ class HybridTokenizer:
         return toks
 
     def tokenize(self, text: str) -> List[Token]:
+        if self.cfg.force_neural:
+            if self._neural is None:
+                raise RuntimeError("force_neural requires a valid neural checkpoint")
+            return self._neural_segment(text, 0, len(text))
         toks = self.tokenize_dict(text)
         if not self.cfg.enable_neural_fallback:
             return toks

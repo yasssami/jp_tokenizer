@@ -47,6 +47,7 @@ class TokenizerConfig:
     unk_penalty: int = 8000
     # TODO check that fallback is used when necessary
     enable_neural_fallback: bool = True
+    force_neural: bool = False
     fallback_cost_per_char_threshold: float = 2500.0
     fallback_expand_chars: int = 2
     fallback_max_span_chars: int = 64

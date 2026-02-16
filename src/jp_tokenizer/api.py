@@ -24,6 +24,8 @@ class TokenizeRequest(BaseModel):
     text: str
     neural_ckpt_dir: Optional[str] = None
     enable_neural_fallback: bool = True
+    force_neural: bool = False
+
     include_pos_en: bool = True
 
 
@@ -47,7 +49,7 @@ def create_app() -> FastAPI:
     # TODO does ts work in gui?
     @app.post("/tokenize", response_model=list[TokenOut])
     def tokenize(req: TokenizeRequest) -> List[TokenOut]:
-        cfg = TokenizerConfig(enable_neural_fallback=req.enable_neural_fallback)
+        cfg = TokenizerConfig(enable_neural_fallback=req.enable_neural_fallback, force_neural=req.force_neural)
         tk = HybridTokenizer(
             dict_cfg=DictConfig(),
             cfg=cfg,
