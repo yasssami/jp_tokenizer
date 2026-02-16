@@ -6,10 +6,9 @@ from rich import print as rprint
 from .config import DictConfig, TokenizerConfig
 from .dict.downloader import ensure_unidic_mecab
 from .hybrid import HybridTokenizer
-
+from .pos_en import translate_pos
 
 app = typer.Typer(add_completion=False)
-
 
 @app.command("download-dict")
 def download_dict(
@@ -25,12 +24,17 @@ def tokenize(
     text: str,
     neural_ckpt: Optional[Path] = typer.Option(None, help="Path to neural checkpoint dir"),
     no_neural: bool = typer.Option(False, help="toggle neural fallback"),
+    pos_en: bool = typer.Option(False, help="include 英語"),
 ) -> None:
     cfg = TokenizerConfig(enable_neural_fallback=not no_neural)
     tk = HybridTokenizer(dict_cfg=DictConfig(), cfg=cfg, neural_ckpt_dir=neural_ckpt)
     toks = tk.tokenize(text)
     for t in toks:
-        rprint(f"{t.start:>4}-{t.end:<4} {t.source:<6} {t.pos:<18} {t.surface}")
+        if pos_en:
+            en = translate_pos(t.pos)
+            rprint(f"{t.start:>4}-{t.end:<4} {t.source:<6} {t.pos:<18} {en:<40} {t.surface}")
+        else:
+            rprint(f"{t.start:>4}-{t.end:<4} {t.source:<6} {t.pos:<18} {t.surface}")
 
 
 @app.command("serve")
