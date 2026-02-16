@@ -5,12 +5,6 @@ from .types import LatticeNode, Morpheme, Token
 from .dict.connection import ConnectionCostMatrix
 from .lattice import Lattice
 
-@dataclass(frozen=True)
-class _BackPtr:
-    prev_pos: int
-    prev_idx: int
-
-
 @dataclass
 class ViterbiResult:
     tokens: List[Token]
@@ -23,37 +17,19 @@ def viterbi_decode(
 ) -> ViterbiResult:
     text = lattice.text
     n = len(text)
-    # dp[pos] -> (best_cost_to_reach_pos, via which node at prev start)
-    # store per-node ending at pos; but traverse by start pos
     INF = 10**18
-    # at each start pos i, consider edges to end on
-    # store best cost arriving at pos i, plus backpointer ref the node used to reach i
-    best_cost: List[int] = [INF] * (n + 1)
-    best_prev: List[Optional[Tuple[int, LatticeNode]]] = [None] * (n + 1)
-    # BOS state: treat as node ending at 0 with IDs = 0
-    best_cost[0] = 0
-    bos_right_id = 0
-
-    # also keep right_id at pos i for best path ending there
-    best_right_id: List[int] = [0] * (n + 1)
-    best_right_id[0] = bos_right_id
-
+    # build node idx for per-node dp (bigram trans cost)
+    nodes: List[LatticeNode] = []
+    nodes_by_start: List[List[int]] = [[] for _ in range(n + 1)]
+    nodes_by_end: List[List[int]] = [[] for _ in range(n + 1)]
     for i in range(n):
-        if best_cost[i] >= INF:
-            continue
-        prev_right_id = best_right_id[i]
         for node in lattice.candidates_from(i):
-            # transition cost + word cost
-            tcost = conn.cost(prev_right_id, node.morph.left_id)
-            new_cost = best_cost[i] + tcost + int(node.morph.word_cost)
-            if new_cost < best_cost[node.end]:
-                best_cost[node.end] = new_cost
-                best_prev[node.end] = (i, node)
-                best_right_id[node.end] = node.morph.right_id
+            idx = len(nodes)
+            nodes.append(node)
+            nodes_by_start[i].append(idx)
+            nodes_by_end[node.end].append(idx)
 
-    # EOS transition from n
-    total = best_cost[n]
-    if total >= INF or best_prev[n] is None:
+    if not nodes:
         # graceful degradation: fallback is per-char tokens
         toks: List[Token] = []
         running = 0
@@ -62,33 +38,84 @@ def viterbi_decode(
             toks.append(Token(ch, "UNK", "", i, i + 1, running, "UNK"))
         return ViterbiResult(toks, running)
 
-    # reconstruct
-    nodes_rev: List[LatticeNode] = []
-    cur = n
-    while cur > 0:
-        prev = best_prev[cur]
-        if prev is None:
-            break
-        i, node = prev
-        nodes_rev.append(node)
-        cur = i
+    best_cost: List[int] = [INF] * len(nodes)
+    best_prev: List[Optional[int]] = [None] * len(nodes)
+
+    bos_right_id = conn.bos_right_id()
+    # init nodes starting at 0 from BOS
+    for idx in nodes_by_start[0]:
+        node = nodes[idx]
+        cost = conn.cost(bos_right_id, node.morph.left_id) + int(node.morph.word_cost)
+        best_cost[idx] = cost
+        best_prev[idx] = None
+
+    # dp fwd by start pos
+    for i in range(1, n + 1):
+        if not nodes_by_start[i]:
+            continue
+        prev_nodes = nodes_by_end[i]
+        if not prev_nodes:
+            continue
+        for idx in nodes_by_start[i]:
+            node = nodes[idx]
+            best = INF
+            best_prev_idx: Optional[int] = None
+            for pidx in prev_nodes:
+                prev_cost = best_cost[pidx]
+                if prev_cost >= INF:
+                    continue
+                prev_node = nodes[pidx]
+                tcost = conn.cost(prev_node.morph.right_id, node.morph.left_id)
+                cand = prev_cost + tcost + int(node.morph.word_cost)
+                if cand < best:
+                    best = cand
+                    best_prev_idx = pidx
+            best_cost[idx] = best
+            best_prev[idx] = best_prev_idx
+
+    # EOS transition from n
+    eos_left_id = conn.eos_left_id()
+    total = INF
+    last_idx: Optional[int] = None
+    for idx in nodes_by_end[n]:
+        cost = best_cost[idx]
+        if cost >= INF:
+            continue
+        node = nodes[idx]
+        total_cost = cost + conn.cost(node.morph.right_id, eos_left_id)
+        if total_cost < total:
+            total = total_cost
+            last_idx = idx
+
+    if total >= INF or last_idx is None:
+        # graceful degradation: fallback is per-char tokens
+        toks = []
+        running = 0
+        for i, ch in enumerate(text):
+            running += 1
+            toks.append(Token(ch, "UNK", "", i, i + 1, running, "UNK"))
+        return ViterbiResult(toks, running)
+
+    # reconstruct best path
+    nodes_rev: List[int] = []
+    cur: Optional[int] = last_idx
+    while cur is not None:
+        nodes_rev.append(cur)
+        cur = best_prev[cur]
     nodes_rev.reverse()
 
-    # token conversion; include cumulative total cost at each token end for debugging
+    # token conversion; include cumulative total cost at each token end
     toks: List[Token] = []
-    cum = 0
-    prev_right = bos_right_id
-    for node in nodes_rev:
-        cum += conn.cost(prev_right, node.morph.left_id) + int(node.morph.word_cost)
+    for idx in nodes_rev:
+        node = nodes[idx]
         toks.append(Token(
             surface=node.morph.surface,
             pos=node.morph.pos,
             feature=node.morph.feature,
             start=node.start,
             end=node.end,
-            total_cost=cum,
+            total_cost=int(best_cost[idx]),
             source=node.morph.source,
         ))
-        prev_right = node.morph.right_id
 
     return ViterbiResult(toks, int(total))

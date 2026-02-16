@@ -49,7 +49,7 @@ class CharClassifier:
         # TODO check char.def variant flattening. maybe try to re-split heuristically.
         if len(lines) <= 2 and "0x" in raw:
             # split around instance of " 0x" ranges to recover structure
-            # still safe: parse token-by-token.
+            # still safe: parse token-by-token
             lines = [t.strip() for t in raw.split("#") if t.strip()]
 
         # two kinds of lines:
@@ -159,15 +159,14 @@ class UnkLexicon:
                 Morpheme(text[start], "UNK", 0, 0, self.default_penalty, feature="", source="UNK")
             )]
 
-        # allow multiple lengths (1..max_len). use first unk entry as base
-        base = entries[0]
         out: List[Tuple[int, Morpheme]] = []
         for L in range(1, max_len + 1):
             surf = text[start:start + L]
-            # slightly increase cost with length to avoid swallowing too much.. TODO calibrate
-            cost = int(base.cost + self.default_penalty + 30 * (L - 1))
-            out.append((
-                start + L,
-                Morpheme(surf, base.pos or "UNK", base.left_id, base.right_id, cost, base.feature, "UNK")
-            ))
+            for entry in entries:
+                # slightly increase cost with length to avoid swallowing too much.. TODO calibrate
+                cost = int(entry.cost + self.default_penalty + 30 * (L - 1))
+                out.append((
+                    start + L,
+                    Morpheme(surf, entry.pos or "UNK", entry.left_id, entry.right_id, cost, entry.feature, "UNK")
+                ))
         return out

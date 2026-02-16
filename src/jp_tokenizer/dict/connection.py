@@ -1,16 +1,48 @@
 from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Dict, Optional, Tuple
 import numpy as np
 
-def _ct_id_def(path: Path) -> int:
-    n = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
+@dataclass(frozen=True)
+class IdDefInfo:
+    count: int
+    label_to_id: Dict[str, int]
+
+
+def _parse_id_def(path: Optional[Path]) -> Optional[IdDefInfo]:
+    if path is None:
+        return None
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    label_to_id: Dict[str, int] = {}
+    line_count = 0
+    explicit = False
+    max_id = -1
+    for line in text.splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
             continue
-        n += 1
-    return n
+        parts = s.split()
+        if not parts:
+            continue
+        line_count += 1
+        label = ""
+        if parts[0].isdigit():
+            explicit = True
+            id_val = int(parts[0])
+            max_id = max(max_id, id_val)
+            if len(parts) > 1:
+                label = parts[1]
+        else:
+            id_val = line_count - 1
+            label = parts[0]
+        if label:
+            label_to_id[label] = id_val
+    if explicit and max_id >= 0:
+        count = max_id + 1
+    else:
+        count = line_count
+    return IdDefInfo(count=count, label_to_id=label_to_id)
 
 class ConnectionCostMatrix:
     """
@@ -31,79 +63,116 @@ class ConnectionCostMatrix:
         self.right_size = 0
         self.left_size = 0
         self.mat: np.ndarray | None = None
+        self._left_info: Optional[IdDefInfo] = None
+        self._right_info: Optional[IdDefInfo] = None
+
+    def _ensure_id_defs(self) -> None:
+        if self._left_info is None:
+            self._left_info = _parse_id_def(self.left_id_def_path)
+        if self._right_info is None:
+            self._right_info = _parse_id_def(self.right_id_def_path)
+
+    def bos_right_id(self) -> int:
+        self._ensure_id_defs()
+        if self._right_info is not None:
+            for key in ("BOS/EOS", "BOS"):
+                if key in self._right_info.label_to_id:
+                    return self._right_info.label_to_id[key]
+        return 0
+
+    def eos_left_id(self) -> int:
+        self._ensure_id_defs()
+        if self._left_info is not None:
+            for key in ("BOS/EOS", "EOS"):
+                if key in self._left_info.label_to_id:
+                    return self._left_info.label_to_id[key]
+        return 0
 
     def load(self) -> None:
         if self.mat is not None:
             return
 
-        left_ct = _ct_id_def(self.left_id_def_path) if self.left_id_def_path else None
-        right_ct = _ct_id_def(self.right_id_def_path) if self.right_id_def_path else None
+        self._ensure_id_defs()
+        left_ct = self._left_info.count if self._left_info is not None else None
+        right_ct = self._right_info.count if self._right_info is not None else None
 
-        with self.matrix_def_path.open("r", encoding="utf-8", errors="ignore") as f:
-            # header: 2 ints
-            header = ""
-            while header.strip() == "":
-                header = f.readline()
-                if header == "":
-                    raise RuntimeError("matrix.def is empty")
-            a_str, b_str = header.strip().split()
-            a = int(a_str)
-            b = int(b_str)
-
-            # decide orientation
-            # mode RL: header = (right_size left_size), lines = (right left cost)
-            # mode LR: header = (left_size right_size), lines = (left right cost) -> transpose at fill
-            mode = "RL"
-
-            if left_ct is not None and right_ct is not None:
-                if a == right_ct and b == left_ct:
-                    mode = "RL"
-                    self.right_size, self.left_size = a, b
-                elif a == left_ct and b == right_ct:
-                    mode = "LR"
-                    self.right_size, self.left_size = b, a
-                else:
-                    # Fallback: trust header as RL, but keep counts for validation
-                    mode = "RL"
-                    self.right_size, self.left_size = a, b
-            else:
-                # No id.def sizes available: assume RL (common MeCab convention)
-                mode = "RL"
-                self.right_size, self.left_size = a, b
-
-            # Use int32 to avoid overflow surprises.
-            mat = np.zeros((self.right_size, self.left_size), dtype=np.int32)
-
-            # Fill
-            line_no = 1
-            for line in f:
-                line_no += 1
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                p = s.split()
-                if len(p) != 3:
-                    continue
-                i0 = int(p[0]); i1 = int(p[1]); c = int(p[2])
+        def _load_with_mode(mode: str) -> np.ndarray:
+            with self.matrix_def_path.open("r", encoding="utf-8", errors="ignore") as f:
+                header = ""
+                while header.strip() == "":
+                    header = f.readline()
+                    if header == "":
+                        raise RuntimeError("matrix.def is empty") #TODO check if rte avoidable; maybe allow no header and infer from lines
+                a_str, b_str = header.strip().split()
+                a = int(a_str)
+                b = int(b_str)
 
                 if mode == "RL":
-                    r, l = i0, i1
+                    right_size, left_size = a, b
                 else:
-                    # header/lines are left,right: transpose into [right,left]
-                    l, r = i0, i1
+                    right_size, left_size = b, a
 
-                if 0 <= r < self.right_size and 0 <= l < self.left_size:
-                    mat[r, l] = c
-                else:
-                    # should be rare as long as dict is formed ok
-                    # try not to hang on failure, just warn & skip
-                    raise RuntimeError(
-                        f"matrix.def index out of bounds at line {line_no}: "
-                        f"(r={r}, l={l}) not in (right={self.right_size}, left={self.left_size}). "
-                        f"Header was ({a},{b}), mode={mode}, left-id lines={left_ct}, right-id lines={right_ct}."
-                    )
+                mat = np.zeros((right_size, left_size), dtype=np.int32)
 
-        self.mat = mat
+                line_no = 1
+                for line in f:
+                    line_no += 1
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    p = s.split()
+                    if len(p) != 3:
+                        continue
+                    i0 = int(p[0]); i1 = int(p[1]); c = int(p[2])
+                    if mode == "RL":
+                        r, l = i0, i1
+                    else:
+                        l, r = i0, i1
+                    if 0 <= r < right_size and 0 <= l < left_size:
+                        mat[r, l] = c
+                    else:
+                        raise RuntimeError(
+                            f"matrix.def index out of bounds at line {line_no}: "
+                            f"(r={r}, l={l}) not in (right={right_size}, left={left_size}). "
+                            f"Header was ({a},{b}), mode={mode}, left-id lines={left_ct}, right-id lines={right_ct}."
+                        )
+            # set sizes only after successful load
+            self.right_size = right_size
+            self.left_size = left_size
+            return mat
+
+        # decide candidate mode
+        # mode RL: header = (right_size left_size), lines = (right left cost)
+        # mode LR: header = (left_size right_size), lines = (left right cost) -> transpose at fill
+        modes: list[str] = []
+        if left_ct is not None and right_ct is not None:
+            with self.matrix_def_path.open("r", encoding="utf-8", errors="ignore") as f:
+                header = ""
+                while header.strip() == "":
+                    header = f.readline()
+                    if header == "":
+                        raise RuntimeError("matrix.def is empty")
+                a_str, b_str = header.strip().split()
+                a = int(a_str); b = int(b_str)
+            if a == right_ct and b == left_ct:
+                modes = ["RL", "LR"]
+            elif a == left_ct and b == right_ct:
+                modes = ["LR", "RL"]
+            else:
+                modes = ["RL", "LR"]
+        else:
+            modes = ["RL", "LR"]
+
+        last_err: Optional[Exception] = None
+        for mode in modes:
+            try:
+                self.mat = _load_with_mode(mode)
+                return
+            except Exception as e:
+                last_err = e
+                continue
+        if last_err is not None:
+            raise last_err
 
     def cost(self, prev_right_id: int, next_left_id: int) -> int:
         self.load()

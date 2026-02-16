@@ -7,7 +7,19 @@ name = "jp-tokenizer"
 version = "1.0.0"
 description = "jp tokenization: UniDic lattice/Viterbi; neural LSTM fallback"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "datasets",
+  "fastapi",
+  "numpy",
+  "platformdirs",
+  "pydantic",
+  "requests",
+  "rich",
+  "torch",
+  "tqdm",
+  "typer",
+  "uvicorn",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
