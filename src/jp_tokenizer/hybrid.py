@@ -95,7 +95,11 @@ class HybridTokenizer:
     def __post_init__(self) -> None:
         ensure_unidic_mecab(self.dict_cfg)
         self.lexicon = UniDicLexicon(self.dict_cfg.lex_csv)
-        self.conn = ConnectionCostMatrix(self.dict_cfg.matrix_def)
+        self.conn = ConnectionCostMatrix(
+            self.dict_cfg.matrix_def,
+            left_id_def_path=self.dict_cfg.left_id_def,
+            right_id_def_path=self.dict_cfg.right_id_def,
+        )
         self.classifier = CharClassifier(self.dict_cfg.char_def)
         self.unk_lex = UnkLexicon(self.dict_cfg.unk_def, self.classifier, self.cfg.unk_penalty)
 
