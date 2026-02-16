@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jp-tokenizer"
+version = "1.0.0"
+description = "jp tokenization: UniDic lattice/Viterbi; neural LSTM fallback"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+jpt = "jp_tokenizer.cli:app"
