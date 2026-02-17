@@ -6,7 +6,7 @@ from .config import DictConfig, TokenizerConfig
 from .dict import ensure_unidic_mecab, UniDicLexicon, ConnectionCostMatrix, CharClassifier, UnkLexicon
 from .lattice import Lattice
 from .viterbi import viterbi_decode
-from .types import Token
+from .types import Morpheme, Token
 from .neural.io import NeuralCheckpoint
 from .neural.constraints import constrained_best_path, B, I, E, S
 from .neural.model import BoundaryBatch
@@ -120,6 +120,76 @@ class HybridTokenizer:
         res = viterbi_decode(lat, self.conn)
         return res.tokens
 
+    def _span_candidates(self, text: str, start: int, end: int) -> List[Morpheme]:
+        max_len = end - start
+        cands: List[Morpheme] = []
+        for e, m in self.lexicon.lookup(text, start, max_len):
+            if e == end:
+                cands.append(m)
+        for e, m in self.unk_lex.unknown_candidates(text, start, max_len):
+            if e == end:
+                cands.append(m)
+        if not cands:
+            cands.append(Morpheme(
+                surface=text[start:end],
+                pos="UNK",
+                left_id=0,
+                right_id=0,
+                word_cost=self.cfg.unk_penalty,
+                feature="",
+                source="UNK",
+            ))
+        return cands
+
+    def _tag_fixed_spans(self, text: str, spans: List[Tuple[int, int]]) -> List[Morpheme]:
+        if not spans:
+            return []
+        cand_lists: List[List[Morpheme]] = [self._span_candidates(text, s, e) for s, e in spans]
+        INF = 10**18
+        dp: List[List[int]] = [[INF] * len(cands) for cands in cand_lists]
+        bp: List[List[int]] = [[-1] * len(cands) for cands in cand_lists]
+
+        bos_right = self.conn.bos_right_id()
+        for j, cand in enumerate(cand_lists[0]):
+            dp[0][j] = self.conn.cost(bos_right, cand.left_id) + int(cand.word_cost)
+
+        for i in range(1, len(cand_lists)):
+            for j, cand in enumerate(cand_lists[i]):
+                best = INF
+                best_prev = -1
+                for k, prev in enumerate(cand_lists[i - 1]):
+                    prev_cost = dp[i - 1][k]
+                    if prev_cost >= INF:
+                        continue
+                    score = prev_cost + self.conn.cost(prev.right_id, cand.left_id) + int(cand.word_cost)
+                    if score < best:
+                        best = score
+                        best_prev = k
+                dp[i][j] = best
+                bp[i][j] = best_prev
+
+        eos_left = self.conn.eos_left_id()
+        best_final = INF
+        best_j = -1
+        last = len(cand_lists) - 1
+        for j, cand in enumerate(cand_lists[last]):
+            total = dp[last][j] + self.conn.cost(cand.right_id, eos_left)
+            if total < best_final:
+                best_final = total
+                best_j = j
+
+        if best_j < 0:
+            return [cands[0] for cands in cand_lists]
+
+        out: List[Morpheme] = [cand_lists[last][best_j]]
+        for i in range(last, 0, -1):
+            best_j = bp[i][best_j]
+            if best_j < 0:
+                best_j = 0
+            out.append(cand_lists[i - 1][best_j])
+        out.reverse()
+        return out
+
     def _neural_segment(self, text: str, start: int, end: int) -> List[Token]:
         import torch # try importing torch locally instead
         assert self._neural is not None and self._vocab is not None
@@ -132,22 +202,19 @@ class HybridTokenizer:
         log_probs = [[float(logp[t, k].item()) for k in range(4)] for t in range(len(ids))]
         path = constrained_best_path(log_probs)
 
-        # convert BIES to tokens
-        toks: List[Token] = []
+        # convert BIES to spans
+        spans: List[Tuple[int, int]] = []
         i = 0
-        cum_cost = 0
         while i < len(chars):
             lab = path[i]
             if lab == S:
-                tok = chars[i]
-                toks.append(Token(tok, "NEURAL", "", start + i, start + i + 1, cum_cost, "NEURAL"))
+                spans.append((start + i, start + i + 1))
                 i += 1
                 continue
             # lab == B: consume until E
             if lab != B:
                 # repair: treat as S
-                tok = chars[i]
-                toks.append(Token(tok, "NEURAL", "", start + i, start + i + 1, cum_cost, "NEURAL"))
+                spans.append((start + i, start + i + 1))
                 i += 1
                 continue
             j = i + 1
@@ -155,12 +222,18 @@ class HybridTokenizer:
                 j += 1
             if j >= len(chars):
                 # no E found; fallback to remaining as one token
-                tok = "".join(chars[i:])
-                toks.append(Token(tok, "NEURAL", "", start + i, end, cum_cost, "NEURAL"))
+                spans.append((start + i, end))
                 break
-            tok = "".join(chars[i:j + 1])
-            toks.append(Token(tok, "NEURAL", "", start + i, start + j + 1, cum_cost, "NEURAL"))
+            spans.append((start + i, start + j + 1))
             i = j + 1
+
+        # assign POS/feature using dictionary candidates for fixed spans
+        morphs = self._tag_fixed_spans(text, spans)
+        toks: List[Token] = []
+        cum_cost = 0
+        for (s, e), m in zip(spans, morphs):
+            surface = text[s:e]
+            toks.append(Token(surface, m.pos, m.feature, s, e, cum_cost, "NEURAL"))
         return toks
 
     def tokenize(self, text: str) -> List[Token]:
