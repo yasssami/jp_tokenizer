@@ -29,3 +29,9 @@ where = ["src"]
 
 [project.scripts]
 jpt = "jp_tokenizer.cli:app"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

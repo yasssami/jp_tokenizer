@@ -28,5 +28,5 @@ class Token:
     feature: str
     start: int
     end: int
-    total_cost: int
+    total_cost: float
     source: str

@@ -3,13 +3,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 from .config import DictConfig, TokenizerConfig
-from .dict import ensure_unidic_mecab, UniDicLexicon, ConnectionCostMatrix, CharClassifier, UnkLexicon
+from .dict import ensure_unidic_mecab, dict_files_present, UniDicLexicon, ConnectionCostMatrix, CharClassifier, UnkLexicon
 from .lattice import Lattice
 from .viterbi import viterbi_decode
 from .types import Morpheme, Token
 from .neural.io import NeuralCheckpoint
 from .neural.constraints import constrained_best_path, B, I, E, S
-from .neural.model import BoundaryBatch
 
 
 def _span_cost_per_char(tokens: List[Token], i0: int, i1: int) -> float:
@@ -82,7 +81,19 @@ def _merge_and_expand_spans(tokens: List[Token], spans: List[Tuple[int, int]], c
         while ib < len(tokens) and tokens[ib].start < end_char:
             ib += 1
         expanded.append((ia, ib))
-    return expanded
+    if not expanded:
+        return []
+    expanded.sort()
+    remerged: List[Tuple[int, int]] = []
+    cur0, cur1 = expanded[0]
+    for a, b in expanded[1:]:
+        if a <= cur1:
+            cur1 = max(cur1, b)
+        else:
+            remerged.append((cur0, cur1))
+            cur0, cur1 = a, b
+    remerged.append((cur0, cur1))
+    return remerged
 
 
 @dataclass
@@ -93,7 +104,19 @@ class HybridTokenizer:
     device: str = "cpu"
 
     def __post_init__(self) -> None:
-        ensure_unidic_mecab(self.dict_cfg)
+        self.lexicon = None
+        self.conn = None
+        self.classifier = None
+        self.unk_lex = None
+        self._dict_ready = False
+
+        self._neural = None
+        self._vocab = None
+        self._vocab_meta = {}
+        if self.neural_ckpt_dir is not None and NeuralCheckpoint(self.neural_ckpt_dir).exists():
+            self._load_neural()
+
+    def _load_dict(self) -> None:
         self.lexicon = UniDicLexicon(self.dict_cfg.lex_csv)
         self.conn = ConnectionCostMatrix(
             self.dict_cfg.matrix_def,
@@ -102,25 +125,38 @@ class HybridTokenizer:
         )
         self.classifier = CharClassifier(self.dict_cfg.char_def)
         self.unk_lex = UnkLexicon(self.dict_cfg.unk_def, self.classifier, self.cfg.unk_penalty)
+        self._dict_ready = True
 
-        self._neural = None
-        self._vocab = None
-        if self.neural_ckpt_dir is not None and NeuralCheckpoint(self.neural_ckpt_dir).exists():
-            self._load_neural()
+    def _ensure_dict(self, required: bool) -> bool:
+        if self._dict_ready:
+            return True
+        if dict_files_present(self.dict_cfg):
+            self._load_dict()
+            return True
+        if not required:
+            return False
+        ensure_unidic_mecab(self.dict_cfg)
+        self._load_dict()
+        return True
 
     def _load_neural(self) -> None:
         ckpt = NeuralCheckpoint(self.neural_ckpt_dir)  # type: ignore[arg-type]
-        model, vocab = ckpt.load(device=self.device)
+        model, vocab, meta = ckpt.load(device=self.device)
         self._neural = model
         self._neural = self._neural.to(self.device)
         self._vocab = vocab
+        self._vocab_meta = meta
 
     def tokenize_dict(self, text: str) -> List[Token]:
+        self._ensure_dict(required=True)
+        assert self.lexicon is not None and self.unk_lex is not None
         lat = Lattice.build(text, self.lexicon, self.unk_lex, self.cfg.max_word_len)
+        assert self.conn is not None
         res = viterbi_decode(lat, self.conn)
         return res.tokens
 
     def _span_candidates(self, text: str, start: int, end: int) -> List[Morpheme]:
+        assert self.lexicon is not None and self.unk_lex is not None
         max_len = end - start
         cands: List[Morpheme] = []
         for e, m in self.lexicon.lookup(text, start, max_len):
@@ -144,6 +180,7 @@ class HybridTokenizer:
     def _tag_fixed_spans(self, text: str, spans: List[Tuple[int, int]]) -> List[Morpheme]:
         if not spans:
             return []
+        assert self.conn is not None
         cand_lists: List[List[Morpheme]] = [self._span_candidates(text, s, e) for s, e in spans]
         INF = 10**18
         dp: List[List[int]] = [[INF] * len(cands) for cands in cand_lists]
@@ -194,13 +231,17 @@ class HybridTokenizer:
         import torch # try importing torch locally instead
         assert self._neural is not None and self._vocab is not None
         sub = text[start:end]
+        if not sub:
+            return []
         chars = list(sub)
-        ids = [self._vocab.get(ch, 1) for ch in chars]  # 1=<UNK>
+        unk_id = int(self._vocab_meta.get("unk_id", 1))
+        ids = [self._vocab.get(ch, unk_id) for ch in chars]
         x = torch.tensor([ids], dtype=torch.long, device=self.device)
         lengths = torch.tensor([len(ids)], dtype=torch.long, device=self.device)
         logp = self._neural.predict_logprobs(x, lengths)[0]  # (T,4)
         log_probs = [[float(logp[t, k].item()) for k in range(4)] for t in range(len(ids))]
         path = constrained_best_path(log_probs)
+        neg_logp = [float(-logp[t, path[t]].item()) for t in range(len(ids))]
 
         # convert BIES to spans
         spans: List[Tuple[int, int]] = []
@@ -227,12 +268,30 @@ class HybridTokenizer:
             spans.append((start + i, start + j + 1))
             i = j + 1
 
-        # assign POS/feature using dictionary candidates for fixed spans
-        morphs = self._tag_fixed_spans(text, spans)
+        # assign POS/feature using dictionary candidates for fixed spans if available
+        if self._dict_ready:
+            morphs = self._tag_fixed_spans(text, spans)
+        else:
+            morphs = [
+                Morpheme(
+                    surface=text[s:e],
+                    pos="UNK",
+                    left_id=0,
+                    right_id=0,
+                    word_cost=self.cfg.unk_penalty,
+                    feature="",
+                    source="UNK",
+                )
+                for s, e in spans
+            ]
         toks: List[Token] = []
-        cum_cost = 0
+        cum_cost = 0.0
         for (s, e), m in zip(spans, morphs):
             surface = text[s:e]
+            local_start = s - start
+            local_end = e - start
+            span_cost = sum(neg_logp[local_start:local_end])
+            cum_cost += span_cost
             toks.append(Token(surface, m.pos, m.feature, s, e, cum_cost, "NEURAL"))
         return toks
 
@@ -240,6 +299,7 @@ class HybridTokenizer:
         if self.cfg.force_neural:
             if self._neural is None:
                 raise RuntimeError("force_neural requires a valid neural checkpoint")
+            self._ensure_dict(required=False)
             return self._neural_segment(text, 0, len(text))
         toks = self.tokenize_dict(text)
         if not self.cfg.enable_neural_fallback:
@@ -265,30 +325,8 @@ class HybridTokenizer:
             cur_tok_idx = b
         out.extend(toks[cur_tok_idx:])
 
-        # recompute cumulative costs deterministically (dict costs not applicable for neural)
-        # keep original dictionary cumulative cost where possible; +0 for neural segments
-
-        # think this is finding first matching elem, results are weird for dupes
-        # cum = 0
-        # for t in out:
-        #     if t.source != "NEURAL":
-        #         cum = t.total_cost
-        #     out[out.index(t)] = Token(t.surface, t.pos, t.feature, t.start, t.end, cum, t.source)
-        # return out
-        fix: List[Token] = []
-        last_dict_cost = 0
-        for t in out:
-            if t.source != "NEURAL":
-                last_dict_cost = t.total_cost
-                fix.append(t)
-            else:
-                fix.append(Token(
-                    surface=t.surface,
-                    pos=t.pos,
-                    feature=t.feature,
-                    start=t.start,
-                    end=t.end,
-                    total_cost=last_dict_cost,
-                    source=t.source,
-                ))
-        return fix
+        # total_cost semantics:
+        # - dict tokens: Viterbi cumulative cost
+        # - neural tokens: segment-cumulative negative log-prob
+        # These are not directly comparable across sources.
+        return out

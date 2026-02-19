@@ -10,6 +10,7 @@ class DictConfig:
     version: str = "2.1.2"
     # TODO doublecheck: should be installed under .\jp_tokenizer\dicts\...
     root_dir: Path = Path(user_data_dir("jp_tokenizer", "jpt")) / "dicts"
+    auto_download: bool = True
 
     @property
     def install_dir(self) -> Path:

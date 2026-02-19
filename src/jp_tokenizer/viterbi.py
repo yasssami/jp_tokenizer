@@ -8,7 +8,7 @@ from .lattice import Lattice
 @dataclass
 class ViterbiResult:
     tokens: List[Token]
-    total_cost: int
+    total_cost: float
 
 
 def viterbi_decode(
@@ -32,9 +32,9 @@ def viterbi_decode(
     if not nodes:
         # graceful degradation: fallback is per-char tokens
         toks: List[Token] = []
-        running = 0
+        running = 0.0
         for i, ch in enumerate(text):
-            running += 1
+            running += 1.0
             toks.append(Token(ch, "UNK", "", i, i + 1, running, "UNK"))
         return ViterbiResult(toks, running)
 
@@ -90,9 +90,9 @@ def viterbi_decode(
     if total >= INF or last_idx is None:
         # graceful degradation: fallback is per-char tokens
         toks = []
-        running = 0
+        running = 0.0
         for i, ch in enumerate(text):
-            running += 1
+            running += 1.0
             toks.append(Token(ch, "UNK", "", i, i + 1, running, "UNK"))
         return ViterbiResult(toks, running)
 
@@ -114,8 +114,8 @@ def viterbi_decode(
             feature=node.morph.feature,
             start=node.start,
             end=node.end,
-            total_cost=int(best_cost[idx]),
+            total_cost=float(best_cost[idx]),
             source=node.morph.source,
         ))
 
-    return ViterbiResult(toks, int(total))
+    return ViterbiResult(toks, float(total))

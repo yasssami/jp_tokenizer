@@ -26,9 +26,10 @@ def tokenize(
     no_neural: bool = typer.Option(False, help="toggle neural fallback"),
     pos_en: bool = typer.Option(False, help="include English POS translation"),
     force_neural: bool = typer.Option(False, help="bypass dict and run neural only"),
+    no_dict_download: bool = typer.Option(False, help="disable dict auto-download"),
 ) -> None:
     cfg = TokenizerConfig(enable_neural_fallback=not no_neural, force_neural=force_neural)
-    tk = HybridTokenizer(dict_cfg=DictConfig(), cfg=cfg, neural_ckpt_dir=neural_ckpt)
+    tk = HybridTokenizer(dict_cfg=DictConfig(auto_download=not no_dict_download), cfg=cfg, neural_ckpt_dir=neural_ckpt)
     toks = tk.tokenize(text)
     for t in toks:
         if pos_en:
